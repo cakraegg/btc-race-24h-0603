@@ -12,6 +12,9 @@ Coinbase BTC 1-minute candles, Nov 10-16 2026):
         the previous close and above the open) -> buy 50% of cash.
       - TIER 2: while holding, if the 60-min return deepens below -2.5%
         -> buy all remaining cash (average entry drops toward the low).
+        The buy is confirmed only when the position actually grows; a
+        fill refused at the next bar's open (gap-up past the 1% slippage
+        cap) re-fires on the next bar instead of burning the tier.
       - EXIT: sell everything 120 bars after the tier-1 fill, or sooner on
         a hard stop 1.5% below the tier-1 decision close. No take-profit,
         no trailing stop: cutting the bounce short cost the most money in
@@ -59,6 +62,7 @@ class Bot:
         self.opens = []    # CBBTC opens, same order
         self.meta = None   # confirmed position: dict(entry_bar, avg, tier2_done)
         self.pending = None  # unconfirmed tier-1 buy: dict(bar, avg)
+        self.pending_tier2 = None  # unconfirmed tier-2 buy: dict(bar, qty_before)
         self.pending_exit = False
         self.cd_until = -1
 
@@ -87,6 +91,18 @@ class Bot:
                 self.cd_until = i + COOLDOWN_BARS
             else:
                 self.pending_exit = False  # rejected: re-evaluate the exit below
+        # Reconcile a pending tier-2 buy: confirm ONLY if the position grew.
+        # A fill refused at the next bar's open (gap-up past the 1%
+        # slippage cap) used to mark tier 2 done without buying anything;
+        # now it clears and the signal may re-fire, like tier 1.
+        if self.pending_tier2 is not None:
+            if self.meta is None:
+                self.pending_tier2 = None  # position gone: stale
+            elif holding is not None and holding.qty > self.pending_tier2["qty_before"]:
+                self.meta["tier2_done"] = True
+                self.pending_tier2 = None
+            elif i >= self.pending_tier2["bar"]:
+                self.pending_tier2 = None  # rejected: allow the signal to re-fire
         if holding is not None and self.meta is None:
             # A position we did not open (should not happen): treat its
             # appearance bar as the entry and its cost as the average.
@@ -166,10 +182,12 @@ class Bot:
             return [{"side": "sell", "symbol": SYMBOL, "qty": holding.qty,
                      "max_slippage_bps": SELL_SLIPPAGE_BPS}]
         # Tier 2: the dip deepened -> deploy the rest of the cash.
-        if not meta["tier2_done"] and self._r60(i) < TIER2_DROP:
+        # Record it as pending; tier2_done is set only once the fill is
+        # confirmed in on_batch (a refused buy re-fires next bar).
+        if not meta["tier2_done"] and self.pending_tier2 is None and self._r60(i) < TIER2_DROP:
             amount = min(state.cash, state.weight_room(SYMBOL))
             if amount >= MIN_NOTIONAL:
-                meta["tier2_done"] = True
+                self.pending_tier2 = {"bar": i + 1, "qty_before": holding.qty}
                 return [{"side": "buy", "symbol": SYMBOL,
                          "notional_quote_units": amount,
                          "max_slippage_bps": BUY_SLIPPAGE_BPS}]
